@@ -1,0 +1,225 @@
+#!/usr/bin/env python3
+# Parse getopt-style help texts for options
+# and generate zsh(1) completion function.
+# https://github.com/maouw/help2comp
+# Based on http://github.com/RobSis/zsh-completion-generator
+
+import sys
+import re
+import subprocess
+import os
+from string import Template
+import logging
+import contextlib
+import shutil
+
+progname = "help2comp"
+
+__version__ = "0.4.0"
+
+usage = f"""Usage: {progname} --help | --version | command [help_flags]
+
+# Get help text from command and print completion function trying default help flags (--help, -h, --usage):
+{progname} command
+
+# Get help text from command and print completion function trying custom help flags:
+{progname} command --help -h help
+
+# Read help text from stdin and print completion function:
+{progname} command --
+"""
+
+if os.getenv("DEBUG"):
+    log_level = logging.DEBUG
+elif (log_level_env := os.getenv("LOGLEVEL", "").upper()) and isinstance(
+    getattr(logging, log_level_env, None), type(logging.DEBUG)
+):
+    log_level = getattr(logging, log_level_env)
+else:
+    log_level = logging.INFO
+
+output_dir = os.getenv("HELP2COMP_OUTPUT_DIR", None)
+
+logging.basicConfig(level=log_level, format="%(levelname)s: %(message)s")
+logger = logging.getLogger(name=progname)
+
+URL = "http://github.com/maouw/help2comp"
+STRIP_CHARS = " \t\n,="
+
+COMPLETE_FUNCTION_TEMPLATE = """
+#compdef $command
+
+# zsh completions for '$command'
+# automatically generated with $url
+local arguments
+
+arguments=(
+$argument_list
+    '*:filename:_files'
+)
+
+_arguments -s $arguments
+"""
+
+ARGUMENT_TEMPLATE = """  {$opts}'[$description]$style'"""
+SINGLE_ARGUMENT_TEMPLATE = """  '$opt[$description]$style'"""
+
+
+def cut_option(line: str):
+    """Cuts out the first option (short or long) and its argument."""
+    # TODO: dare to make it regex-free?
+    newline = line.strip(STRIP_CHARS)
+    opt = re.findall(r"^(-[a-zA-Z0-9\-]+(?:[\[\ =][^\-\ ][a-zA-Z\<\>\[\|\:\]\-\_\?#]*\]?)?)", line)
+    if len(opt) > 0:
+        newline = line.replace(opt[0], "", 1).strip(STRIP_CHARS)
+        # return without parameter
+        return newline, re.split("[ [=]", opt[0], maxsplit=1)[0]
+    else:
+        return newline, None
+
+
+def parse_options(help_text: list[str]):
+    """Parse the options line by line.
+
+    When description is missing and options are missing on
+    consecutive line, link them together.
+    """
+    all_options = []
+    previous_description_missing = False
+    for line in help_text:
+        line = line.strip(STRIP_CHARS)
+        if re.match(r"^--?[a-zA-Z0-9]+", line):  # starts with option
+            previous_description_missing = False
+            options = []
+            while True:
+                line, opt = cut_option(line)
+                if opt is None:
+                    break
+
+                options.append(opt)
+
+            if len(line) == 0:
+                previous_description_missing = True
+
+            options.append(line)
+            all_options.append(options)
+        elif previous_description_missing:
+            all_options[-1][-1] = line
+            previous_description_missing = False
+
+    return all_options
+
+
+def _escape(line: str):
+    """Escape the syntax-breaking characters."""
+    line = line.replace("[", r"\[").replace("]", r"\]")
+    line = re.sub("'", "", line)  # ' is unescapable afaik
+    return line
+
+
+def generate_argument_list(options: list[str]):
+    """Generate list of arguments from the template."""
+    argument_list = []
+    for opts in options:
+        model = {}
+        # remove unescapable chars.
+
+        desc = list(_escape(opts[-1]))
+        if len(desc) > 1 and desc[1].islower():
+            desc[0] = desc[0].lower()
+        model["description"] = "".join(desc)
+        model["style"] = ""
+        if len(opts) > 2:
+            model["opts"] = ",".join(opts[:-1])
+            argument_list.append(Template(ARGUMENT_TEMPLATE).safe_substitute(model))
+        elif len(opts) == 2:
+            model["opt"] = opts[0]
+            argument_list.append(Template(SINGLE_ARGUMENT_TEMPLATE).safe_substitute(model))
+        else:
+            pass
+
+    return "\n".join(argument_list)
+
+
+def generate_completion_function(options: list[str], command: str):
+    """Generate completion function from the template."""
+    model = {}
+    model["command"] = command
+    model["argument_list"] = generate_argument_list(options)
+    model["url"] = URL
+    return Template(COMPLETE_FUNCTION_TEMPLATE).safe_substitute(model).strip()
+
+
+def prompt_help_text(help_text: str, max_lines: int = 10):
+    while True:
+        if len(help_text) <= 0:
+            return False
+        terminal_size = shutil.get_terminal_size((80, 20))
+        print("=" * terminal_size.columns)
+        print(("\n".join(repr(help_text).splitlines()[:max_lines]) + "\n"))
+        print("=" * terminal_size.columns)
+
+        while True:
+            confirm = input("Is this the correct help text? (y/n)")
+            if confirm.lower() in ["y", "yes"]:
+                return True
+            elif confirm.lower() in ["n", "no"]:
+                return False
+            else:
+                print("Please enter 'y' or 'n'.")
+
+
+if __name__ == "__main__":
+    match sys.argv[1:]:
+        case ["--help", "-h", "--usage"]:
+            print(usage)
+            sys.exit(0)
+        case ["--version", "-v"]:
+            print(__version__)
+            sys.exit(0)
+        case [command, *help_flags]:
+            if not shutil.which(command):
+                print(f"Command '{command}' not found.", file=sys.stderr)
+                sys.exit(1)
+            options = []
+            if not help_flags:
+                help_flags = ["--help", "-h", "--usage"]
+
+            if help_flags == ["--"]:
+                options = parse_options(sys.stdin.readlines())
+            else:
+                for help_flag in help_flags:
+                    logger.debug(msg=f"Trying to get help text with {help_flag}")
+                    with contextlib.suppress(Exception):
+                        cmd_result = subprocess.run(
+                            [command, help_flag], capture_output=True, encoding="utf-8", check=False
+                        )
+                        options = (
+                            parse_options(cmd_result.stdout.splitlines())
+                            or parse_options(cmd_result.stderr.splitlines())
+                            or []
+                        )
+                        if len(options) > 0:
+                            break
+
+            if not options:
+                print("No options found!", file=sys.stderr)
+                sys.exit(1)
+
+            try:
+                completion_function = generate_completion_function(options, sys.argv[1])
+                output_fd = sys.stdout
+                if output_dir:
+                    os.makedirs(output_dir, exist_ok=True)
+                    output_path = os.path.join(output_dir, "_" + command)
+                    if os.path.exists(output_path):
+                        logger.warning(f"File {output_path} already exists. Overwriting.")
+                    output_fd = open(output_path, "w")
+                print(completion_function, file=output_fd)
+            except Exception as e:
+                print("Could not generate completion function!", file=sys.stderr)
+                print("Exception:", e, file=sys.stderr)
+                sys.exit(1)
+        case _:
+            print(usage, file=sys.stderr)
+            sys.exit(1)
